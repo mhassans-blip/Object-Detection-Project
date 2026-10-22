@@ -10,7 +10,7 @@ from PIL import Image
 from io import BytesIO
 
 BASE_DIR = Path(__file__).resolve().parent
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8001")
 API_SCRIPT = BASE_DIR / "api.py"
 
 st.set_page_config(page_title="Gun Object Detection", page_icon="🎯", layout="wide")
