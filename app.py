@@ -10,30 +10,69 @@ from PIL import Image
 from io import BytesIO
 
 BASE_DIR = Path(__file__).resolve().parent
-API_URL = os.getenv("API_URL", "http://127.0.0.1:8001")
+API_URL = "http://127.0.0.1:8000"
 API_SCRIPT = BASE_DIR / "api.py"
 
 st.set_page_config(page_title="Gun Object Detection", page_icon="🎯", layout="wide")
 
+
+
 def start_local_api():
-    # Streamlit and FastAPI run together on the same machine. No separate API hosting required.
-    if st.session_state.get("api_process") is None:
-        log_path = BASE_DIR / "api.log"
-        log_file = open(log_path, "a", encoding="utf-8")
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "api:app", "--host", "127.0.0.1", "--port", "8000"],
-            cwd=str(BASE_DIR), stdout=log_file, stderr=subprocess.STDOUT
+    # Reuse the already-running FastAPI server.
+    try:
+        response = requests.get(
+            "http://127.0.0.1:8000/health",
+            timeout=5
         )
-        st.session_state.api_process = proc
-        st.session_state.api_log_file = log_file
-    for _ in range(20):
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException:
+        pass
+
+    # Start FastAPI only if it is not reachable.
+    log_path = BASE_DIR / "api.log"
+    log_file = open(log_path, "a", encoding="utf-8")
+
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-m", "uvicorn",
+                "api:app",
+                "--host", "127.0.0.1",
+                "--port", "8000"
+            ],
+            cwd=str(BASE_DIR),
+            stdout=log_file,
+            stderr=subprocess.STDOUT
+        )
+    except Exception as exc:
+        log_file.close()
+        st.error(f"Could not launch FastAPI: {exc}")
+        return None
+
+    st.session_state["api_process"] = proc
+    st.session_state["api_log_file"] = log_file
+
+    for _ in range(30):
+        if proc.poll() is not None:
+            break
+
         try:
-            r = requests.get(f"{API_URL}/health", timeout=1)
-            if r.ok:
-                return r.json()
+            response = requests.get(
+                "http://127.0.0.1:8000/health",
+                timeout=2
+            )
+            if response.ok:
+                return response.json()
         except requests.RequestException:
-            time.sleep(0.5)
+            pass
+
+        time.sleep(1)
+
+    st.error("FastAPI startup timed out. Check api.log.")
     return None
+
+
 
 st.title("🎯 Gun Object Detection")
 st.caption("YOLO object detection · Streamlit frontend + FastAPI backend in one local project")
