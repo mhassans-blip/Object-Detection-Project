@@ -1,142 +1,115 @@
-from pathlib import Path
 import base64
-import os
-import subprocess
-import sys
-import time
-import requests
+from io import BytesIO
+from pathlib import Path
+
 import streamlit as st
 from PIL import Image
-from io import BytesIO
 
-BASE_DIR = Path(__file__).resolve().parent
-API_URL = "http://127.0.0.1:8000"
-API_SCRIPT = BASE_DIR / "api.py"
+# This imports the same model-loading and inference functions used by FastAPI.
+# No Uvicorn subprocess, localhost URL, or separate backend process is needed.
+from api import MODEL_PATH, get_model, predict_image
 
 st.set_page_config(page_title="Gun Object Detection", page_icon="🎯", layout="wide")
 
 
-
-def start_local_api():
-    # Reuse the already-running FastAPI server.
-    try:
-        response = requests.get(
-            "http://127.0.0.1:8000/health",
-            timeout=5
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException:
-        pass
-
-    # Start FastAPI only if it is not reachable.
-    log_path = BASE_DIR / "api.log"
-    log_file = open(log_path, "a", encoding="utf-8")
-
-    try:
-        proc = subprocess.Popen(
-            [
-                sys.executable, "-m", "uvicorn",
-                "api:app",
-                "--host", "127.0.0.1",
-                "--port", "8000"
-            ],
-            cwd=str(BASE_DIR),
-            stdout=log_file,
-            stderr=subprocess.STDOUT
-        )
-    except Exception as exc:
-        log_file.close()
-        st.error(f"Could not launch FastAPI: {exc}")
-        return None
-
-    st.session_state["api_process"] = proc
-    st.session_state["api_log_file"] = log_file
-
-    for _ in range(30):
-        if proc.poll() is not None:
-            break
-
-        try:
-            response = requests.get(
-                "http://127.0.0.1:8000/health",
-                timeout=2
-            )
-            if response.ok:
-                return response.json()
-        except requests.RequestException:
-            pass
-
-        time.sleep(1)
-
-    st.error("FastAPI startup timed out. Check api.log.")
-    return None
-
+@st.cache_resource(show_spinner=False)
+def load_yolo_model():
+    # Streamlit caches the loaded model for the life of this app process.
+    return get_model()
 
 
 st.title("🎯 Gun Object Detection")
-st.caption("YOLO object detection · Streamlit frontend + FastAPI backend in one local project")
+st.caption("YOLO object detection · Streamlit UI with in-process inference")
+
 with st.sidebar:
     st.header("Settings")
     confidence = st.slider("Confidence threshold", 0.05, 0.95, 0.25, 0.05)
     st.markdown("---")
-    st.write("**Backend:** FastAPI")
-    st.write("**Model:** YOLO11n fine-tuned on your dataset")
+    st.write("**Inference:** Direct Python call (no separate FastAPI process)")
+    st.write(f"**Model file:** `{MODEL_PATH.name}`")
 
-health = start_local_api()
-if health is None:
-    st.error("FastAPI backend did not start. Check api.log and install requirements.")
-    st.stop()
-if health.get("status") != "ok":
-    st.warning("The backend is running, but the trained model is missing.")
-    st.code("python train.py", language="bash")
-    st.info("Train the model first. Once best.pt exists, restart this Streamlit app.")
+if not Path(MODEL_PATH).is_file():
+    st.error(f"Trained model not found: {MODEL_PATH}")
+    st.info(
+        "Place `best.pt` in the same folder as `app.py` and `api.py`, "
+        "or configure the MODEL_PATH environment variable."
+    )
     st.stop()
 
 left, right = st.columns([1, 1], gap="large")
+
 with left:
     st.subheader("Upload an image")
-    uploaded = st.file_uploader("Choose JPG, JPEG, PNG, or WEBP", type=["jpg", "jpeg", "png", "webp"])
-    if uploaded:
-        st.image(uploaded, caption="Original image", use_container_width=True)
+    uploaded = st.file_uploader(
+        "Choose JPG, JPEG, PNG, or WEBP",
+        type=["jpg", "jpeg", "png", "webp"],
+    )
+
+    if uploaded is not None:
+        try:
+            original_image = Image.open(BytesIO(uploaded.getvalue())).convert("RGB")
+        except Exception:
+            st.error("This image could not be opened. Try a JPG, PNG, or WEBP file.")
+            st.stop()
+
+        st.image(original_image, caption="Original image", use_container_width=True)
+
         if st.button("Detect objects", type="primary", use_container_width=True):
-            with st.spinner("Running YOLO detection..."):
-                try:
-                    response = requests.post(
-                        f"{API_URL}/predict",
-                        files={"file": (uploaded.name, uploaded.getvalue(), uploaded.type or "image/jpeg")},
-                        params={"conf": confidence}, timeout=180
+            try:
+                with st.spinner("Loading model and running detection..."):
+                    load_yolo_model()
+                    result = predict_image(
+                        original_image,
+                        conf=confidence,
+                        filename=uploaded.name,
                     )
-                    if not response.ok:
-                        try:
-                            detail = response.json().get("detail", response.text)
-                        except Exception:
-                            detail = response.text
-                        st.error(f"Prediction failed: {detail}")
-                    else:
-                        st.session_state.last_result = response.json()
-                except requests.RequestException as exc:
-                    st.error(f"Could not reach FastAPI: {exc}")
+                st.session_state["last_result"] = result
+            except Exception as exc:
+                st.error(f"Detection failed: {exc}")
 
 with right:
     st.subheader("Detection results")
     result = st.session_state.get("last_result")
+
     if result:
-        annotated = Image.open(BytesIO(base64.b64decode(result["annotated_image"])))
-        st.image(annotated, caption="Annotated prediction", use_container_width=True)
-        a, b = st.columns(2)
-        a.metric("Objects detected", result["detections_count"])
-        b.metric("Image size", f'{result["image_width"]} × {result["image_height"]}')
-        if result["detections"]:
-            st.dataframe([
-                {"Class": d["class"], "Confidence": f'{d["confidence"]:.2f}%',
-                 "Bounding box (x1,y1,x2,y2)": str(d["box"])}
-                for d in result["detections"]
-            ], use_container_width=True, hide_index=True)
-        else:
-            st.info("No objects found above the selected confidence threshold.")
+        try:
+            annotated_bytes = base64.b64decode(result["annotated_image"])
+            annotated_image = Image.open(BytesIO(annotated_bytes)).convert("RGB")
+            st.image(
+                annotated_image,
+                caption="Annotated prediction",
+                use_container_width=True,
+            )
+
+            metric_a, metric_b = st.columns(2)
+            metric_a.metric("Objects detected", result["detections_count"])
+            metric_b.metric(
+                "Image size",
+                f'{result["image_width"]} × {result["image_height"]}',
+            )
+
+            if result["detections"]:
+                st.dataframe(
+                    [
+                        {
+                            "Class": detection["class"],
+                            "Confidence": f'{detection["confidence"]:.2f}%',
+                            "Bounding box (x1, y1, x2, y2)": str(detection["box"]),
+                        }
+                        for detection in result["detections"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("No objects found above the selected confidence threshold.")
+        except Exception as exc:
+            st.error(f"Could not display the result: {exc}")
     else:
-        st.info("Upload an image and click **Detect objects** to see bounding boxes and confidence scores.")
+        st.info("Upload an image and click **Detect objects** to see the results.")
 
 st.markdown("---")
-st.caption("Safety note: model predictions can be wrong. Do not use this demo as the sole basis for safety or law-enforcement decisions.")
+st.caption(
+    "Safety note: model predictions can be wrong. Do not use this demo as the sole "
+    "basis for safety or law-enforcement decisions."
+)
